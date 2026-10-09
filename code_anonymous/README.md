@@ -10,23 +10,26 @@ nodes in decentralized federated learning".
 | `src/dfl/engine.py` | Decentralized FL simulator: honest network, eclipse, attacks, aggregation rules at the victim, experiment grids |
 | `src/dfl/core.py` | Data loading and Dirichlet partition, models, local training, evaluation, aggregation rules |
 | `src/models/mnist_cnn.py` | CNN used for MNIST and Fashion-MNIST |
-| `scripts/` | The run scripts used for the anchored, rerun and heterogeneity experiments |
-| `results/dfl/*_seed*.json` | Per-round logs of every victim configuration, five seeds per grid |
-| `figures/make_tables.py`, `figures/make_figures.py` | Produce Tables 2-6 and Figs. 4-8 from the result files |
+| `scripts/download_datasets.sh`, `scripts/prepare_datasets.py` | Download FEMNIST, Shakespeare, Tiny ImageNet and CIFAR-100, and convert them to tensors |
+| `results/dfl/*_seed*.json` | Per-round logs of every victim configuration: ten seeds for the main benchmarks, five for the other settings |
+| `figures/make_tables.py`, `figures/make_figures.py` | Produce the result tables and Figs. 4-8 from the result files |
+| `figures/stats.py` | Paired tests (t-test, Wilcoxon, Holm correction) and 95% confidence intervals (appendix tables) |
 | `figures/make_diagrams.py` | Produces Figs. 1-3 |
 | `reproduce.sh` | Reruns every experiment and regenerates all tables and figures |
 
 ## Requirements
 
 Python 3.10 or later, the packages in `requirements.txt` (a CUDA build of PyTorch is recommended), and
-internet access on the first run to download MNIST, Fashion-MNIST and CIFAR-10 through torchvision.
+internet access on the first run to download MNIST, Fashion-MNIST and CIFAR-10 through torchvision and the other
+datasets through `scripts/download_datasets.sh`.
 
 ## Regenerate the tables and figures from the included results
 
 ```bash
 pip install -r requirements.txt
-python3 figures/make_tables.py    # writes manuscript/tables/*.tex
-python3 figures/make_figures.py   # writes figures/fig4-fig8 (.pdf, .png)
+python3 figures/make_tables.py --revision   # writes manuscript/tables/*.tex
+python3 figures/stats.py --ext              # writes the statistical tables
+python3 figures/make_figures.py             # writes figures/fig4-fig8 (.pdf, .png)
 ```
 
 ## Rerun the experiments

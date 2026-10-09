@@ -39,6 +39,11 @@ class RunConfig:
     benign_est_steps: int = 10
     eval_nodes: int = 10         # honest nodes sampled for the network accuracy
     eval_every: int = 1
+    # Revision additions (paper/09_revision.md); the defaults reproduce the original runs exactly.
+    arch: str = "default"        # default (per-dataset CNN/LSTM) | resnet20
+    topology: str = "ba"         # ba (Barabasi-Albert, m = ba_m) | er (mean degree 6) | ws (Watts-Strogatz) | ring
+    partition: str = "dirichlet"  # dirichlet | natural (FEMNIST writers, Shakespeare roles; data/processed)
+    root_size: int = 100         # FLTrust root dataset held by the victim (only used by the fltrust rule)
 
 
 @dataclasses.dataclass
@@ -57,7 +62,7 @@ class Variant:
 
 
 AGGS = {"mean": core.agg_mean, "trimmed": core.agg_trimmed_mean, "median": core.agg_median,
-        "multikrum": core.agg_multikrum}
+        "multikrum": core.agg_multikrum, "bulyan": core.agg_bulyan, "rfa": core.agg_rfa}
 LOG_KEYS = ("acc", "asr", "cos_sybil", "cos_sybil_ref_prev", "cos_honest_ref_prev", "norm_ratio", "sybil_weight",
             "honest_weight", "self_weight", "diverged")
 
@@ -69,14 +74,31 @@ class Engine:
         torch.manual_seed(cfg.seed)
         self.rng = np.random.default_rng(cfg.seed)
         xtr, ytr, xte, yte = core.load_dataset(cfg.dataset, self.device)
-        parts, aux = core.dirichlet_partition(ytr.cpu().numpy(), cfg.num_nodes, cfg.alpha, self.rng, cfg.aux_frac)
+        if cfg.partition == "natural":  # one node per writer (FEMNIST) or speaking role (Shakespeare), fixed split
+            p = core.load_processed(cfg.dataset)
+            parts, aux = p["parts"][:cfg.num_nodes], p["aux"]
+        else:
+            parts, aux = core.dirichlet_partition(ytr.cpu().numpy(), cfg.num_nodes, cfg.alpha, self.rng, cfg.aux_frac)
         self.parts = [torch.as_tensor(p, device=self.device) for p in parts]
         self.aux = torch.as_tensor(aux, device=self.device)
         self.tr = core.Trainer(cfg.dataset, xtr, ytr, xte, yte, self.device, cfg.lr, cfg.batch_size,
-                               cfg.target_class, cfg.seed)
+                               cfg.target_class, cfg.seed, arch=cfg.arch)
         self.gen = torch.Generator(device=self.device).manual_seed(cfg.seed + 1)
+        if any(v.agg == "fltrust" for v in variants):  # separate generator: does not change any other random stream
+            pool = np.setdiff1d(np.arange(len(ytr)), np.asarray(aux))
+            self.root = torch.as_tensor(np.random.default_rng(cfg.seed + 7).choice(pool, cfg.root_size, replace=False),
+                                        device=self.device)
 
-        graph = nx.barabasi_albert_graph(cfg.num_nodes, cfg.ba_m, seed=cfg.seed)
+        if cfg.topology == "ba":
+            graph = nx.barabasi_albert_graph(cfg.num_nodes, cfg.ba_m, seed=cfg.seed)
+        elif cfg.topology == "er":
+            graph = nx.erdos_renyi_graph(cfg.num_nodes, 2 * cfg.ba_m / (cfg.num_nodes - 1), seed=cfg.seed)
+        elif cfg.topology == "ws":
+            graph = nx.connected_watts_strogatz_graph(cfg.num_nodes, 2 * cfg.ba_m, 0.1, seed=cfg.seed)
+        elif cfg.topology == "ring":  # ring lattice: every node linked to its 2 * ba_m nearest nodes
+            graph = nx.watts_strogatz_graph(cfg.num_nodes, 2 * cfg.ba_m, 0.0, seed=cfg.seed)
+        else:
+            raise ValueError(cfg.topology)
         degs = dict(graph.degree())
         cands = sorted(degs, key=lambda n: (abs(degs[n] - cfg.victim_degree) + (100 if degs[n] < cfg.victim_degree else 0), n))
         self.victim = cands[0]
@@ -191,6 +213,24 @@ class Engine:
                 w = torch.relu((upd @ own) / (norms.squeeze(1) * own.norm() + 1e-12))
                 upd = upd * (own.norm() / norms)
             new = xv + (w.unsqueeze(1) * upd).sum(0) / w.sum()
+        elif v.agg == "signsgd":
+            upd = models - xv
+            new = xv + core.agg_signsgd(upd, upd[0].norm())
+            w = torch.ones(len(models), device=self.device)
+        elif v.agg == "cc_bucket":  # centered clipping on buckets of 2, centred on the previous aggregate update
+            upd = models - xv
+            center = st.get("cc_center", torch.zeros_like(xv))
+            agg = core.agg_cc_bucketing(upd, center, upd[0].norm(), self.gen)
+            st["cc_center"] = agg
+            new = xv + agg
+            w = torch.ones(len(models), device=self.device)
+        elif v.agg == "fltrust":  # FLTrust with a root dataset of root_size clean samples held by the victim
+            upd = models - xv
+            g0 = self.tr.train(xv, self.root, self.cfg.local_steps) - xv
+            norms = upd.norm(dim=1) + 1e-12
+            w = torch.relu((upd @ g0) / (norms * g0.norm() + 1e-12))
+            upd = upd * (g0.norm() / norms).unsqueeze(1)
+            new = xv + (w.unsqueeze(1) * upd).sum(0) / w.sum() if w.sum() > 0 else hv
         else:
             new, w = AGGS[v.agg](models)
         if not bool(torch.isfinite(new).all()):
@@ -252,6 +292,34 @@ AGG_NAMES = ["mean", "trimmed", "median", "multikrum", "foolsgold", "foolsgold_d
              "selfanchor"]
 
 
+NEW_AGGS = ["bulyan", "rfa", "signsgd", "cc_bucket", "fltrust"]
+# Rules used on the datasets and architectures added in the revision (FG-Delta and clipping alone dropped).
+EXT_AGGS = ["mean", "trimmed", "median", "multikrum", "foolsgold", "clipfg", "selfanchor"] + NEW_AGGS
+
+
+def defense_grid() -> List[Variant]:
+    """Revision G1a: the five added rules, with plain averaging as the in-run reference, against every attack."""
+    return [Variant(name=f"{a}|{g}", attack=a, agg=g) for a in ATTACKS for g in ["mean"] + NEW_AGGS]
+
+
+def ext_grid() -> List[Variant]:
+    """Revision G2-G3: every attack against the extended rule set on the added datasets and architectures."""
+    return [Variant(name=f"{a}|{g}", attack=a, agg=g) for a in ATTACKS for g in EXT_AGGS]
+
+
+def ext_small_grid() -> List[Variant]:
+    """Revision G2-G3, ResNet-20 runs: these need about 150 rounds to learn, so key attacks against key rules only."""
+    return [Variant(f"{att}|{g}", attack=att, agg=g) for att in ("none", "signflip", "identical", "minmax-t", "eclipse")
+            for g in ("mean", "median", "multikrum", "foolsgold", "clipfg", "rfa", "fltrust")]
+
+
+def topo_grid() -> List[Variant]:
+    """Revision G1c: key attacks against key rules on other topologies and network sizes, plus partial eclipse."""
+    out = [Variant(f"{att}|{g}", attack=att, agg=g) for att in ("none", "identical", "minmax-t", "eclipse")
+           for g in ("mean", "median", "foolsgold", "clipfg", "rfa")]
+    return out + [Variant(f"eclipse|{g}|frac=0.5", agg=g, frac=0.5) for g in ("mean", "foolsgold")]
+
+
 def main_grid() -> List[Variant]:
     return [Variant(name=f"{a}|{g}", attack=a, agg=g) for a in ATTACKS for g in AGG_NAMES]
 
@@ -297,9 +365,15 @@ if __name__ == "__main__":
     p.add_argument("--rounds", type=int, default=40)
     p.add_argument("--alpha", type=float, default=0.2)
     p.add_argument("--grid", default="full",
-                   choices=["none", "main", "reduced", "hetero", "partial", "anchor", "fixnan", "full"])
+                   choices=["none", "main", "reduced", "hetero", "partial", "anchor", "fixnan", "full",
+                            "defense", "ext", "topo", "ext_small"])
     p.add_argument("--lr", type=float, default=0.01)
     p.add_argument("--local-steps", type=int, default=30)
+    p.add_argument("--arch", default="default")
+    p.add_argument("--topology", default="ba")
+    p.add_argument("--nodes", type=int, default=50)
+    p.add_argument("--partition", default="dirichlet")
+    p.add_argument("--target", type=int, default=0)
     p.add_argument("--out", default="results/dfl")
     p.add_argument("--tag", default="")
     a = p.parse_args()
@@ -328,6 +402,15 @@ if __name__ == "__main__":
                              for s in (0.5, 2.0, 3.0)]
         if a.grid == "none":  # calibration of the honest network only
             variants = [Variant("none|mean", attack="none"), Variant("eclipse|mean"), Variant("identical|mean")]
+        if a.grid == "defense":
+            variants = defense_grid()
+        if a.grid == "ext":
+            variants = ext_grid()
+        if a.grid == "topo":
+            variants = topo_grid()
+        if a.grid == "ext_small":
+            variants = ext_small_grid()
         cfg = RunConfig(dataset=a.dataset, seed=seed, rounds=a.rounds, alpha=a.alpha if a.alpha > 0 else None,
-                        local_steps=a.local_steps, lr=a.lr)
+                        local_steps=a.local_steps, lr=a.lr, arch=a.arch, topology=a.topology, num_nodes=a.nodes,
+                        partition=a.partition, target_class=a.target)
         Engine(cfg, variants).run(os.path.join(a.out, f"{a.dataset}{a.tag}_seed{seed}.json"))

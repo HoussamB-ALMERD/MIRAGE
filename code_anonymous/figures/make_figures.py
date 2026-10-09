@@ -48,7 +48,9 @@ def series(runs, name, metric="asr"):
 
 
 def final(runs, name, metric="asr"):
-    v = [np.nanmean(r["variants"][name][metric][-LAST:]) for r in runs if name in r["variants"]]
+    # non-finite entries count as missing, and a seed without any finite value is left out (as in tab4_stealth)
+    v = [x[np.isfinite(x)].mean() for r in runs if name in r["variants"]
+         for x in [np.asarray(r["variants"][name][metric][-LAST:], float)] if np.isfinite(x).any()]
     return (np.mean(v), np.std(v)) if v else (np.nan, np.nan)
 
 
